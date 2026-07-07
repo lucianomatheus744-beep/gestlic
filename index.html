@@ -1165,6 +1165,36 @@ body {
   color: #10B981 !important;
   border-color: #10B981 !important;
 }
+/* ===== OUTLOOK SYNC ===== */
+.btn-outlook-active {
+  color: #0078d4 !important;
+  border-color: #0078d4 !important;
+}
+.outlook-modal-box {
+  background: #fff;
+  border-radius: 12px;
+  padding: 28px 32px;
+  width: 100%; max-width: 500px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+}
+.outlook-steps {
+  background: #f8f9fa;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.8;
+  border-left: 3px solid #0078d4;
+}
+.outlook-steps strong { color: var(--text-1); }
+.outlook-steps code {
+  background: #e9ecef;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  color: #d63384;
+}
 .cloud-modal-overlay {
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.45);
@@ -1341,6 +1371,10 @@ body {
             <button class="btn-ghost btn-sm" id="btnCloudSync" title="Sincronização em Nuvem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/></svg>
               Nuvem
+            </button>
+            <button class="btn-ghost btn-sm" id="btnOutlook" title="Sincronizar com Outlook Calendar">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              Outlook
             </button>
             <div class="cloud-status-bar hidden" id="cloudStatusBar">
               <div class="cloud-dot"></div>
@@ -2562,18 +2596,23 @@ function saveLicitacao() {
     observacoes: document.getElementById('fieldObservacoes').value.trim()
   };
 
+  let savedLic;
   if (state.editingId) {
     const idx = state.licitacoes.findIndex(l => l.id === state.editingId);
     if (idx !== -1) {
       state.licitacoes[idx] = { ...state.licitacoes[idx], ...data };
+      savedLic = state.licitacoes[idx];
       toast('Licitação atualizada com sucesso!', 'success');
     }
   } else {
-    state.licitacoes.unshift({ id: uid(), ...data, createdAt: new Date().toISOString() });
+    const newLic = { id: uid(), ...data, createdAt: new Date().toISOString() };
+    state.licitacoes.unshift(newLic);
+    savedLic = newLic;
     toast('Licitação cadastrada com sucesso!', 'success');
   }
 
   save();
+  if (savedLic) syncLicToOutlook(savedLic);
   closeModal('modalOverlay');
 
   if (state.currentSection === 'dashboard') renderDashboard();
@@ -2589,6 +2628,7 @@ function openConfirmDelete(id) {
 
 function confirmDelete() {
   if (!state.deletingId) return;
+  deleteOutlookEvents(state.deletingId);
   state.licitacoes = state.licitacoes.filter(l => l.id !== state.deletingId);
   save();
   state.deletingId = null;
@@ -2981,21 +3021,35 @@ function initEvents() {
 
 function init() {
   loadCloudCfg();
+  loadOutlookCfg();
   load();
   initLogo();
   updateTopbarDate();
   setInterval(updateTopbarDate, 60000);
   initEvents();
 
-  // Botão de nuvem
+  // Botão de nuvem JSONBin
   var btnCloud = document.getElementById('btnCloudSync');
   if (btnCloud) btnCloud.addEventListener('click', openCloudModal);
+
+  // Botão Outlook
+  var btnOutlookEl = document.getElementById('btnOutlook');
+  if (btnOutlookEl) btnOutlookEl.addEventListener('click', function() {
+    if (outlookAccount) openOutlookModal(); else outlookLogin();
+  });
 
   // Fechar modal ao clicar fora
   var cloudModal = document.getElementById('cloudModal');
   if (cloudModal) cloudModal.addEventListener('click', function(e) {
     if (e.target === cloudModal) closeCloudModal();
   });
+  var outlookModalEl = document.getElementById('outlookModal');
+  if (outlookModalEl) outlookModalEl.addEventListener('click', function(e) {
+    if (e.target === outlookModalEl) closeOutlookModal();
+  });
+
+  // Inicializar MSAL se já configurado
+  if (outlookCfg?.clientId) initMSAL();
 
   // Se nuvem configurada, carrega dela ao iniciar
   if (cloudCfg) {
@@ -3190,6 +3244,219 @@ function closeCloudModal() {
   document.getElementById('cloudModal')?.classList.add('hidden');
 }
 
+// ==================== OUTLOOK / MSAL ====================
+const GRAPH_ENDPOINT = 'https://graph.microsoft.com/v1.0';
+const OUTLOOK_CFG_KEY = 'gestlic_outlook_v1';
+const OUTLOOK_EVENTS_KEY = 'gestlic_outlook_events';
+let msalInstance = null;
+let outlookAccount = null;
+let outlookCfg = null;
+let outlookEventMap = {};
+
+function loadOutlookCfg() {
+  try {
+    outlookCfg = JSON.parse(localStorage.getItem(OUTLOOK_CFG_KEY) || 'null');
+    outlookEventMap = JSON.parse(localStorage.getItem(OUTLOOK_EVENTS_KEY) || '{}');
+  } catch(e) {}
+}
+function saveOutlookEventMap() {
+  localStorage.setItem(OUTLOOK_EVENTS_KEY, JSON.stringify(outlookEventMap));
+}
+
+function loadMSALScript() {
+  return new Promise((resolve, reject) => {
+    if (window.msal) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = 'https://alcdn.msauth.net/browser/3.26.0/js/msal-browser.min.js';
+    s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+async function initMSAL() {
+  if (!outlookCfg?.clientId) return;
+  await loadMSALScript();
+  msalInstance = new window.msal.PublicClientApplication({
+    auth: {
+      clientId: outlookCfg.clientId,
+      authority: 'https://login.microsoftonline.com/common',
+      redirectUri: window.location.origin + window.location.pathname.replace(/\/$/, '') + '/'
+    },
+    cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false }
+  });
+  await msalInstance.initialize();
+  const accounts = msalInstance.getAllAccounts();
+  if (accounts.length > 0) { outlookAccount = accounts[0]; updateOutlookBtn(); }
+}
+
+async function getOutlookToken() {
+  if (!msalInstance || !outlookAccount) return null;
+  try {
+    const r = await msalInstance.acquireTokenSilent({ scopes: ['Calendars.ReadWrite'], account: outlookAccount });
+    return r.accessToken;
+  } catch(e) {
+    try {
+      const r = await msalInstance.acquireTokenPopup({ scopes: ['Calendars.ReadWrite'] });
+      outlookAccount = r.account; return r.accessToken;
+    } catch(err) { return null; }
+  }
+}
+
+async function outlookLogin() {
+  if (!outlookCfg?.clientId) { openOutlookModal(); return; }
+  await loadMSALScript();
+  if (!msalInstance) await initMSAL();
+  try {
+    const r = await msalInstance.loginPopup({ scopes: ['Calendars.ReadWrite'] });
+    outlookAccount = r.account;
+    updateOutlookBtn();
+    toast('Conectado: ' + outlookAccount.username, 'success');
+    await syncAllToOutlook();
+  } catch(e) { toast('Erro ao conectar com Outlook.', 'error'); }
+}
+
+function outlookLogout() {
+  if (msalInstance && outlookAccount) msalInstance.logoutPopup({ account: outlookAccount }).catch(()=>{});
+  outlookAccount = null; updateOutlookBtn();
+}
+
+function updateOutlookBtn() {
+  const btn = document.getElementById('btnOutlook');
+  if (!btn) return;
+  if (outlookAccount) {
+    btn.classList.add('btn-outlook-active');
+    btn.title = 'Outlook: ' + outlookAccount.username + ' (clique para opções)';
+  } else {
+    btn.classList.remove('btn-outlook-active');
+    btn.title = 'Sincronizar com Outlook Calendar';
+  }
+}
+
+function buildCalEvent(lic, type) {
+  const date = type === 'sessao' ? lic.proximaSessao : lic.dataAbertura;
+  const time = type === 'sessao' ? lic.horaProximaSessao : lic.horaAbertura;
+  if (!date) return null;
+  const [h, m] = (time || '09:00').split(':');
+  const start = new Date(date + 'T' + h.padStart(2,'0') + ':' + (m||'00') + ':00');
+  const end = new Date(start.getTime() + 3600000);
+  const label = type === 'sessao' ? 'Sessão' : 'Abertura';
+  return {
+    subject: `[GestLic] ${label}: Edital ${lic.edital} — ${lic.orgao}`,
+    body: { contentType: 'HTML', content: `<p><b>Órgão:</b> ${lic.orgao}<br><b>Edital:</b> ${lic.edital}<br><b>Objeto:</b> ${lic.objeto}<br><b>Status:</b> ${lic.status}<br><b>Valor:</b> ${formatBRL(lic.valor)}</p>` },
+    start: { dateTime: start.toISOString().replace('Z',''), timeZone: 'America/Sao_Paulo' },
+    end:   { dateTime: end.toISOString().replace('Z',''),   timeZone: 'America/Sao_Paulo' },
+    isReminderOn: true, reminderMinutesBeforeStart: 1440,
+    categories: ['GestLic']
+  };
+}
+
+async function upsertOutlookEvent(lic, type) {
+  const token = await getOutlookToken();
+  if (!token) return;
+  const ev = buildCalEvent(lic, type);
+  if (!ev) return;
+  const key = type === 'abertura' ? 'aberturaId' : 'sessaoId';
+  const existId = (outlookEventMap[lic.id] || {})[key];
+  const url = existId ? `${GRAPH_ENDPOINT}/me/events/${existId}` : `${GRAPH_ENDPOINT}/me/events`;
+  const method = existId ? 'PATCH' : 'POST';
+  const res = await fetch(url, { method, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(ev) });
+  const data = await res.json();
+  if (data.id) {
+    if (!outlookEventMap[lic.id]) outlookEventMap[lic.id] = {};
+    outlookEventMap[lic.id][key] = data.id;
+    saveOutlookEventMap();
+  }
+}
+
+async function deleteOutlookEvents(licId) {
+  const token = await getOutlookToken();
+  if (!token) return;
+  const map = outlookEventMap[licId]; if (!map) return;
+  for (const id of [map.aberturaId, map.sessaoId].filter(Boolean)) {
+    await fetch(`${GRAPH_ENDPOINT}/me/events/${id}`, { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + token } }).catch(()=>{});
+  }
+  delete outlookEventMap[licId]; saveOutlookEventMap();
+}
+
+async function syncLicToOutlook(lic) {
+  if (!outlookAccount) return;
+  await upsertOutlookEvent(lic, 'abertura');
+  if (lic.proximaSessao) await upsertOutlookEvent(lic, 'sessao');
+}
+
+async function syncAllToOutlook() {
+  if (!outlookAccount) return;
+  const btn = document.getElementById('btnOutlook');
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg> Sincronizando…';
+  for (const lic of state.licitacoes) { await syncLicToOutlook(lic); }
+  if (btn) { btn.innerHTML = orig; btn.classList.add('btn-outlook-active'); }
+  toast('Licitações sincronizadas com Outlook! ✅', 'success');
+}
+
+// ===== ICS EXPORT =====
+function exportICS() {
+  const lines = ['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//GestLic//Licitacoes//PT','CALSCALE:GREGORIAN','METHOD:PUBLISH'];
+  for (const lic of state.licitacoes) {
+    const addEvent = (date, time, type) => {
+      if (!date) return;
+      const [h, m] = (time || '09:00').split(':');
+      const pad = (n) => String(n).padStart(2,'0');
+      const dt = date.replace(/-/g,'') + 'T' + pad(h) + pad(m||'00') + '00';
+      const hEnd = pad(parseInt(h) + 1);
+      const dtEnd = date.replace(/-/g,'') + 'T' + hEnd + pad(m||'00') + '00';
+      const label = type === 'sessao' ? 'Sessão' : 'Abertura';
+      lines.push('BEGIN:VEVENT');
+      lines.push('UID:' + lic.id + '-' + type + '@gestlic');
+      lines.push('DTSTART;TZID=America/Sao_Paulo:' + dt);
+      lines.push('DTEND;TZID=America/Sao_Paulo:' + dtEnd);
+      lines.push('SUMMARY:' + label + ': Edital ' + lic.edital + ' - ' + lic.orgao);
+      lines.push('DESCRIPTION:' + lic.objeto.substring(0, 400).replace(/[\r\n,;]/g, ' '));
+      lines.push('CATEGORIES:GestLic');
+      lines.push('BEGIN:VALARM\r\nTRIGGER:-P1D\r\nACTION:DISPLAY\r\nDESCRIPTION:Lembrete GestLic\r\nEND:VALARM');
+      lines.push('END:VEVENT');
+    };
+    addEvent(lic.dataAbertura, lic.horaAbertura, 'abertura');
+    addEvent(lic.proximaSessao, lic.horaProximaSessao, 'sessao');
+  }
+  lines.push('END:VCALENDAR');
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/calendar;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), { href: url, download: 'licitacoes-gestlic.ics' });
+  a.click(); URL.revokeObjectURL(url);
+  toast('Arquivo .ics gerado! Abra no Outlook para importar.', 'success');
+}
+
+// ===== OUTLOOK MODAL =====
+function openOutlookModal() {
+  const modal = document.getElementById('outlookModal');
+  if (!modal) return;
+  document.getElementById('outlookClientId').value = outlookCfg?.clientId || '';
+  const statusEl = document.getElementById('outlookUserStatus');
+  if (statusEl) statusEl.textContent = outlookAccount ? '✅ Conectado como: ' + outlookAccount.username : 'Não conectado';
+  document.getElementById('btnOutlookDisconnect').classList.toggle('hidden', !outlookAccount);
+  document.getElementById('btnOutlookConnect').textContent = outlookAccount ? 'Reconectar' : 'Conectar Outlook';
+  modal.classList.remove('hidden');
+}
+function closeOutlookModal() { document.getElementById('outlookModal')?.classList.add('hidden'); }
+
+async function saveOutlookCfgAndConnect() {
+  const clientId = document.getElementById('outlookClientId').value.trim();
+  if (!clientId || clientId.length < 30) { toast('Client ID inválido. Deve ter formato UUID.', 'error'); return; }
+  outlookCfg = { clientId };
+  localStorage.setItem(OUTLOOK_CFG_KEY, JSON.stringify(outlookCfg));
+  closeOutlookModal();
+  msalInstance = null;
+  await initMSAL();
+  await outlookLogin();
+}
+function disconnectOutlook() {
+  outlookLogout();
+  localStorage.removeItem(OUTLOOK_CFG_KEY);
+  outlookCfg = null; closeOutlookModal();
+  toast('Outlook desconectado.', 'warn');
+}
+
 document.addEventListener('DOMContentLoaded', init);
 
   </script>
@@ -3215,6 +3482,41 @@ document.addEventListener('DOMContentLoaded', init);
       <button class="btn-ghost btn-sm hidden" id="btnDisconnectCloud" style="color:#EF4444;border-color:#EF4444" onclick="disconnectCloud()">Desconectar</button>
       <button class="btn-ghost btn-sm" onclick="closeCloudModal()">Cancelar</button>
       <button class="btn-primary" id="btnSaveCloud" onclick="testAndSaveCloudCfg()">Salvar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Outlook Calendar -->
+<div class="cloud-modal-overlay hidden" id="outlookModal">
+  <div class="outlook-modal-box">
+    <div class="cloud-modal-title">📅 Sincronização com Outlook Calendar</div>
+    <div id="outlookUserStatus" style="font-size:12px;color:#0078d4;margin-bottom:12px;font-weight:600;min-height:18px;"></div>
+
+    <div class="outlook-steps">
+      <strong>Como obter o Client ID do Azure:</strong><br>
+      1. Acesse <a href="https://portal.azure.com" target="_blank" style="color:#0078d4">portal.azure.com</a> → <b>Microsoft Entra ID</b> → <b>Registros de aplicativos</b> → <b>Novo registro</b><br>
+      2. Nome: <code>GestLic</code> | Tipo de conta: <b>Contas em qualquer diretório + pessoais</b><br>
+      3. URI de redirecionamento: <b>SPA</b> → <code>https://lucianomatheus744-beep.github.io/gestlic/</code><br>
+      4. Após criar: <b>Permissões de API</b> → Adicionar → Microsoft Graph → Delegada → <code>Calendars.ReadWrite</code><br>
+      5. Copie o <b>ID do Aplicativo (Cliente)</b> e cole abaixo
+    </div>
+
+    <div class="cloud-field">
+      <label>Client ID do Azure (Application ID)</label>
+      <input id="outlookClientId" type="text" placeholder="ex: 12345678-abcd-1234-efgh-123456789012" autocomplete="off">
+    </div>
+
+    <div style="border-top:1px solid var(--border);margin:16px 0;padding-top:14px;">
+      <div style="font-size:12px;color:var(--text-2);margin-bottom:10px;"><strong>Alternativa rápida</strong> — sem configuração Azure:</div>
+      <button class="btn-ghost btn-sm" onclick="exportICS(); closeOutlookModal();" style="color:#0078d4;border-color:#0078d4;width:100%;justify-content:center;">
+        ⬇ Exportar .ics (Importar no Outlook)
+      </button>
+    </div>
+
+    <div class="cloud-modal-actions">
+      <button class="btn-ghost btn-sm hidden" id="btnOutlookDisconnect" style="color:#EF4444;border-color:#EF4444" onclick="disconnectOutlook()">Desconectar</button>
+      <button class="btn-ghost btn-sm" onclick="closeOutlookModal()">Cancelar</button>
+      <button class="btn-primary" id="btnOutlookConnect" onclick="saveOutlookCfgAndConnect()">Conectar Outlook</button>
     </div>
   </div>
 </div>
